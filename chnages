@@ -404,15 +404,25 @@ def build_system_preamble(pack: AnalysisPack) -> str:
 EVN:
 
 
-PDF_MAX_BYTES=10000000
-PDF_TEXT_CHAR_BUDGET=80000
-PDF_TABLE_CELL_BUDGET=15000
-PDF_PER_PAGE_TIMEOUT_MS=250
-PDF_OCR_ENABLED=true
-PDF_OCR_MAX_PAGES=10
-PDF_OCR_TIME_BUDGET_S=30
-FILESTORE_ROOT=/tmp/triton_openai_files
+# === PDF processing (all pure Python; offline) ===
+PDF_MAX_BYTES=10000000              # 10 MB hard cap after base64 decode
+PDF_TEXT_CHAR_BUDGET=80000          # max chars of extracted text put into the analysis pack
+PDF_TABLE_CELL_BUDGET=15000         # max number of table cells converted to Markdown
+PDF_PER_PAGE_TIMEOUT_MS=250         # soft guard for pathological pages
+PDF_OCR_ENABLED=true                # enable EasyOCR fallback for pages with no text layer
+PDF_OCR_MAX_PAGES=10                # OCR at most N pages per doc
+PDF_OCR_TIME_BUDGET_S=30            # total OCR time budget per doc (seconds)
 
+# === Image preflight (protect memory) ===
 MEDIA_MAX_IMAGE_BYTES=5000000
 MEDIA_MIME_ALLOW=image/jpeg,image/png,image/webp
+
+# === Optional local file storage for page PNGs (safe to include) ===
+FILESTORE_ROOT=/tmp/triton_openai_files
+
+# === Image flow toggle ===
+# "disabled" → images return a clear 400
+# "http://127.0.0.1:8000/v1" → proxy input_image requests to a local vLLM OpenAI server
+VLLM_OPENAI_BASE=disabled
+
 
