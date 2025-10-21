@@ -1,1 +1,418 @@
+python/openai/openai_frontend/models.py
+
+-from pydantic import BaseModel
+-from typing import List
++from pydantic import BaseModel
++from typing import List, Union, Dict, Any
+
+ class Message(BaseModel):
+     role: str
+-    content: str
++    # Allow OpenAI-style content parts (offline: base64 only)
++    content: Union[str, List[Dict[str, Any]]]
+
+python/openai/openai_frontend/filestore.py
+
+import os, uuid, pathlib
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import Response
+
+ROOT = os.getenv("FILESTORE_ROOT", "/tmp/triton_openai_files")
+pathlib.Path(ROOT).mkdir(parents=True, exist_ok=True)
+
+class LocalFileStore:
+    def __init__(self, root: str = ROOT):
+        self.root = root
+    def save_bytes(self, data: bytes, mime: str) -> str:
+        fid = str(uuid.uuid4())
+        ext = ".png" if mime == "image/png" else ".bin"
+        fp = os.path.join(self.root, fid + ext)
+        with open(fp, "wb") as f:
+            f.write(data)
+        return f"/v1/files/{fid}{ext}/content"
+    def get(self, fid_with_ext: str) -> tuple[bytes, str]:
+        fp = os.path.join(self.root, fid_with_ext)
+        if not os.path.isfile(fp):
+            raise FileNotFoundError
+        mime = "image/png" if fp.endswith(".png") else "application/octet-stream"
+        with open(fp, "rb") as f:
+            return f.read(), mime
+
+router = APIRouter()
+
+@router.get("/v1/files/{fid:path}/content")
+def get_file(fid: str):
+    try:
+        data, mime = LocalFileStore().get(fid)
+        return Response(content=data, media_type=mime)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="Not found")
+
+python/openai/openai_frontend/main.py
+
+--- a/python/openai/openai_frontend/main.py
++++ b/python/openai/openai_frontend/main.py
+@@
+ from fastapi import FastAPI
+ from .chat import router as chat_router
++from .filestore import router as files_router
+@@
+ app = FastAPI()
+ app.include_router(chat_router)
++app.include_router(files_router)
+
+
+python/openai/openai_frontend/media_validate.py
+
+import os, base64
+
+MAX_IMAGE_BYTES = int(os.getenv("MEDIA_MAX_IMAGE_BYTES", "5000000"))
+ALLOWED = set((os.getenv("MEDIA_MIME_ALLOW", "image/jpeg,image/png,image/webp")).split(","))
+
+def preflight_input_image(part: dict):
+    if part.get("type") != "input_image":
+        return
+    img = part.get("image", {})
+    mime = (img.get("mime_type") or "").lower()
+    data = img.get("data") or ""
+    if mime not in ALLOWED:
+        raise ValueError(f"Unsupported image mime: {mime}")
+    # base64 ~ 4/3 expansion: quick check first
+    est = int(len(data) * 0.75)
+    if est > MAX_IMAGE_BYTES:
+        raise ValueError("Image too large (precheck)")
+    # decode to be sure
+    raw = base64.b64decode(data)
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError("Image too large")
+
+python/openai/openai_frontend/chat.py
+
+ from fastapi import APIRouter, Request, HTTPException
+-from fastapi.responses import JSONResponse
++from fastapi.responses import JSONResponse, StreamingResponse
++import os, base64, requests
+
+ from .pdf_processor import process_pdf_bytes, build_system_preamble
+ from .filestore import LocalFileStore
++from .media_validate import preflight_input_image
+
+ router = APIRouter()
+
+ FILE_MAX = int(os.getenv("PDF_MAX_BYTES", "10000000"))
++VLLM_OPENAI_BASE = os.getenv("VLLM_OPENAI_BASE", "disabled").strip()  # "disabled" or "http://127.0.0.1:8000/v1"
+
+ def _is_pdf_part(part: dict) -> bool:
+     return (
+         part.get("type") == "input_file"
+         and part.get("mime_type") == "application/pdf"
+         and ("data" in part)
+     )
+
++def _has_input_images(messages: list[dict]) -> bool:
++    for m in messages:
++        c = m.get("content")
++        if isinstance(c, list):
++            for p in c:
++                if p.get("type") == "input_image":
++                    return True
++    return False
++
++def _preflight_images(messages: list[dict]):
++    for m in messages:
++        c = m.get("content")
++        if isinstance(c, list):
++            for p in c:
++                if p.get("type") == "input_image":
++                    preflight_input_image(p)
+
+ def _normalize_messages_for_pdf(messages: list[dict]) -> list[dict]:
+     """Replace PDF 'input_file' parts with a text Analysis Pack (OpenAI-compatible)."""
+     lf = LocalFileStore()
+     new_msgs = []
+     for m in messages:
+         c = m.get("content")
+         if not isinstance(c, list):
+             new_msgs.append(m); continue
+         new_content = []
+         for part in c:
+             if _is_pdf_part(part):
+                 try:
+                     pdf_bytes = base64.b64decode(part["data"])
+                 except Exception:
+                     raise HTTPException(status_code=400, detail="Invalid base64 for PDF")
+                 if len(pdf_bytes) > FILE_MAX:
+                     raise HTTPException(status_code=413, detail="PDF too large")
+                 pack = process_pdf_bytes(pdf_bytes, file_store=lf)
+                 system_text = build_system_preamble(pack)
+                 new_content.append({"type":"text","text": system_text})
+             else:
+                 new_content.append(part)
+         new_msgs.append({**m, "content": new_content})
+     return new_msgs
+
+ @router.post("/v1/chat/completions")
+ async def chat_completions(req: Request):
+     payload = await req.json()
+     msgs = payload.get("messages", [])
+
+     # 1) PDFs → analysis pack (text path)
+     needs_pdf = any(isinstance(m.get("content"), list) and any(_is_pdf_part(p) for p in m["content"]) for m in msgs)
+     if needs_pdf:
+         payload = {**payload, "messages": _normalize_messages_for_pdf(msgs)}
+
+     # 2) Images → either 400 (Option A) or proxy to local vLLM OpenAI server (Option B)
+     if _has_input_images(payload.get("messages", [])):
+         try:
+             _preflight_images(payload.get("messages", []))
+         except ValueError as e:
+             return JSONResponse(status_code=400, content={"error":{"type":"invalid_image","message":str(e)}})
+
+-        # Old: go to text path
+-        return await handle_text_only(payload)
++        if VLLM_OPENAI_BASE == "disabled":
++            return JSONResponse(status_code=400, content={"error":{
++                "type":"unsupported_media",
++                "message":"Image inputs are disabled on this deployment."
++            }})
++        # Forward unchanged to local vLLM OpenAI server (multimodal preprocessing happens there)
++        r = requests.post(f"{VLLM_OPENAI_BASE}/chat/completions", json=payload, stream=True, timeout=300)
++        return StreamingResponse(r.iter_content(chunk_size=8192),
++                                 status_code=r.status_code,
++                                 media_type=r.headers.get("content-type", "application/json"))
+
+     # 3) No PDFs, no images → original text path
+     return await handle_text_only(payload)
+
+python/openai/openai_frontend/pdf_processor.py
+
+# pdf_processor.py — pure Python PDF → analysis-pack (text + tables + optional OCR + optional page renders)
+# Deps (pip wheels only): pdfplumber, PyMuPDF (fitz), easyocr (optional)
+import io, os, base64, time, json, hashlib
+from dataclasses import dataclass, asdict
+
+import pdfplumber                     # text, tables, metadata
+import fitz                           # PyMuPDF: page render + embedded images
+try:
+    import easyocr                    # optional OCR
+    _EASYOCR_OK = True
+except Exception:
+    _EASYOCR_OK = False
+
+# Budgets (no page cap; we use compute/output budgets)
+TEXT_CHAR_BUDGET       = int(os.getenv("PDF_TEXT_CHAR_BUDGET", "80000"))
+TABLE_CELL_BUDGET      = int(os.getenv("PDF_TABLE_CELL_BUDGET", "15000"))
+PER_PAGE_TIMEOUT_MS    = int(os.getenv("PDF_PER_PAGE_TIMEOUT_MS", "250"))
+OCR_ENABLED            = os.getenv("PDF_OCR_ENABLED", "true").lower() == "true"
+OCR_MAX_PAGES          = int(os.getenv("PDF_OCR_MAX_PAGES", "10"))
+OCR_TIME_BUDGET_S      = int(os.getenv("PDF_OCR_TIME_BUDGET_S", "30"))
+RENDER_ON_DEMAND       = os.getenv("PDF_RENDER_IMAGES_ON_DEMAND", "true").lower() == "true"
+IMAGE_MAX_SIDE         = int(os.getenv("PDF_IMAGE_MAX_SIDE", "2048"))
+
+@dataclass
+class PageIndex:
+    page: int
+    has_text: bool
+    word_count: int
+    table_count: int
+    figure_count: int
+
+@dataclass
+class AnalysisPack:
+    meta: dict
+    index: list   # List[PageIndex]. We will json-ify dataclasses.
+    text_excerpt: str
+    tables_markdown: list
+    image_urls: list
+    notes: dict
+
+def _downscale_pix(pix: fitz.Pixmap) -> bytes:
+    # Convert and downscale to PNG within IMAGE_MAX_SIDE
+    img = fitz.Pixmap(pix, 0) if pix.alpha else pix
+    pil = img.tobytes("png")
+    # We could resize via PIL, but PyMuPDF render at moderate DPI keeps us safe.
+    return pil
+
+def _table_to_markdown(table, cell_budget_left):
+    # table: list[list[str|None]]
+    if not table or not table[0]:
+        return None, cell_budget_left
+    headers = table[0]
+    rows = table[1:]
+    # Count cells and truncate if needed
+    consumed = len(headers)
+    out_rows = []
+    for r in rows:
+        row_cells = len(r)
+        if consumed + row_cells > cell_budget_left:
+            break
+        out_rows.append(r)
+        consumed += row_cells
+    # markdown
+    head = "| " + " | ".join(h or "" for h in headers) + " |"
+    sep  = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join(c or "" for c in r) + " |" for r in out_rows]
+    md = "\n".join([head, sep] + body)
+    return md, cell_budget_left - consumed
+
+def process_pdf_bytes(pdf_bytes: bytes, file_store=None) -> AnalysisPack:
+    """
+    Returns an AnalysisPack. file_store must implement .save_bytes(bytes, mime) -> url (optional, used for images).
+    """
+    t0 = time.time()
+    text_budget = TEXT_CHAR_BUDGET
+    table_budget = TABLE_CELL_BUDGET
+    ocr_time_used = 0.0
+    ocr_pages_done = 0
+
+    index = []
+    text_chunks = []
+    md_tables = []
+    image_urls = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        meta = {
+            "pages": len(pdf.pages),
+            "docinfo": {k: (str(v) if v is not None else "") for k, v in (pdf.metadata or {}).items()}
+        }
+
+        # Open same bytes in PyMuPDF for figures/stats/renders
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        for i in range(len(pdf.pages)):
+            page_pl = pdf.pages[i]
+            page_fz = doc.load_page(i)
+            page_start = time.time()
+
+            # quick counts
+            figures = len(page_pl.images or []) + len(page_fz.get_images(full=True) or [])
+            has_text = False
+            words = 0
+
+            # 1) text extraction (bounded)
+            text = ""
+            try:
+                text = page_pl.extract_text(layout=True) or ""
+                words = len(text.split())
+                has_text = len(text.strip()) > 0
+            except Exception:
+                text = ""
+
+            # 2) table extraction (only while budget remains)
+            tables_here = 0
+            if table_budget > 0:
+                try:
+                    raw_tables = page_pl.extract_tables()
+                except Exception:
+                    raw_tables = []
+                for t in raw_tables:
+                    if table_budget <= 0:
+                        break
+                    md, table_budget = _table_to_markdown(t, table_budget)
+                    if md:
+                        md_tables.append(f"<!-- page:{i+1} -->\n{md}")
+                        tables_here += 1
+
+            # 3) OCR selective
+            if (not has_text) and OCR_ENABLED and _EASYOCR_OK and (ocr_pages_done < OCR_MAX_PAGES) and (ocr_time_used < OCR_TIME_BUDGET_S):
+                # render page to image for OCR
+                ocr_t0 = time.time()
+                pix = page_fz.get_pixmap(dpi=180)  # moderate DPI
+                png_bytes = _downscale_pix(pix)
+                # run OCR
+                reader = easyocr.Reader(['en'], gpu=False)  # construct once if you like; left simple for clarity
+                try:
+                    res = reader.readtext(png_bytes, detail=0, paragraph=True)
+                    ocr_text = "\n".join(res).strip()
+                except Exception:
+                    ocr_text = ""
+                ocr_time = time.time() - ocr_t0
+                ocr_time_used += ocr_time
+                if ocr_text:
+                    text = ocr_text
+                    has_text = True
+                    words = len(text.split())
+                    ocr_pages_done += 1
+
+            # 4) accumulate text under budget with page markers
+            if text and text_budget > 0:
+                chunk = text[: min(len(text), text_budget)]
+                text_chunks.append(f"\n## Page {i+1}\n{chunk}")
+                text_budget -= len(chunk)
+
+            # 5) index entry
+            index.append(PageIndex(
+                page=i+1, has_text=has_text, word_count=words, table_count=tables_here, figure_count=figures
+            ))
+
+            # per-page timeout guard
+            if (time.time() - page_start) * 1000.0 > PER_PAGE_TIMEOUT_MS:
+                # soft stop: continue but we already bounded heavy work via budgets
+                pass
+
+        # do NOT render images by default; that is on-demand. If you want initial thumbs, you can add here.
+
+    notes = {
+        "truncated": (text_budget <= 0) or (table_budget <= 0),
+        "used_ocr": (ocr_pages_done > 0),
+        "ocr_pages_done": ocr_pages_done,
+        "budgets": {
+            "text_chars_used": TEXT_CHAR_BUDGET - text_budget,
+            "text_chars_budget": TEXT_CHAR_BUDGET,
+            "table_cells_budget_left": table_budget,
+            "ocr_time_used_s": round(ocr_time_used, 3),
+        },
+        "processed_secs": round(time.time() - t0, 3),
+    }
+
+    # Build the analysis text block we’ll feed to the model (OpenAI-compatible "text" content)
+    pack = AnalysisPack(
+        meta=meta,
+        index=[asdict(x) for x in index],
+        text_excerpt=("".join(text_chunks)).strip(),
+        tables_markdown=md_tables,
+        image_urls=image_urls,
+        notes=notes,
+    )
+    return pack
+
+def render_pages_to_images(pdf_bytes: bytes, pages: list[int], file_store, limit: int = 8) -> list[str]:
+    """Render selected pages (1-based) to PNG, save via file_store, return URLs."""
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    urls = []
+    for p in pages[:limit]:
+        page = doc.load_page(p-1)
+        pix = page.get_pixmap(dpi=180)
+        png_bytes = _downscale_pix(pix)
+        url = file_store.save_bytes(png_bytes, "image/png")
+        urls.append(url)
+    return urls
+
+def build_system_preamble(pack: AnalysisPack) -> str:
+    body = json.dumps(asdict(pack), ensure_ascii=False)
+    return (
+        "You are a document analysis assistant. Use the Analysis Pack below as ground truth.\n"
+        "- For summaries: ≤10 bullets + a JSON metadata object.\n"
+        "- For tables: output Markdown or CSV; cite page numbers.\n"
+        "- For figures: list the provided image URLs.\n"
+        "- If asked for specific pages, extract only those; if content was truncated, say so.\n"
+        "\n--- BEGIN ANALYSIS PACK (JSON) ---\n"
+        f"{body}\n"
+        "--- END ANALYSIS PACK ---\n"
+    )
+
+EVN:
+
+
+PDF_MAX_BYTES=10000000
+PDF_TEXT_CHAR_BUDGET=80000
+PDF_TABLE_CELL_BUDGET=15000
+PDF_PER_PAGE_TIMEOUT_MS=250
+PDF_OCR_ENABLED=true
+PDF_OCR_MAX_PAGES=10
+PDF_OCR_TIME_BUDGET_S=30
+FILESTORE_ROOT=/tmp/triton_openai_files
+
+MEDIA_MAX_IMAGE_BYTES=5000000
+MEDIA_MIME_ALLOW=image/jpeg,image/png,image/webp
 
