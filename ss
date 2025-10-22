@@ -25,4 +25,8 @@ curl -s http://localhost:9000/v1/chat/completions \
   -H 'content-type: application/json' \
   -d '{"model":"whatever","messages":[{"role":"user","content":"ping"}]}'
 
+  curl -s http://localhost:9000/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"m","messages":[{"role":"user","content":[{"type":"input_file","mime_type":"application/pdf","data":"BASE64"}]}]}'
+
 
