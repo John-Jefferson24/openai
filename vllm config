@@ -1,0 +1,37 @@
+# INLINE START COMMAND (bash -lc)
+set -euo pipefail
+ulimit -n 1048576 || true
+
+# vLLM OpenAI server for Llama-4-Scout-17B-16E on 4× H100
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /models/llama4-scout \
+  --served-model-name llama-4-scout-17b-16e \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 \
+  --dtype auto \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --download-dir /models/llama4-scout \
+  --trust-remote-code true \
+  --limit-mm-per-prompt image=5 \
+  --max-num-batched-tokens 32768 \
+  --max-num-seqs 64
+
+  # INLINE START COMMAND (bash -lc)
+set -euo pipefail
+ulimit -n 1048576 || true
+
+# vLLM OpenAI server for Gemma-3-27B-IT on 4× H100
+python3 -m vllm.entrypoints.openai.api_server \
+  --model /models/gemma3-27b-it \
+  --served-model-name gemma-3-27b-it \
+  --host 0.0.0.0 --port 8000 \
+  --tensor-parallel-size 4 \
+  --dtype auto \
+  --gpu-memory-utilization 0.90 \
+  --max-model-len 8192 \
+  --download-dir /models/gemma3-27b-it \
+  --trust-remote-code true \
+  --limit-mm-per-prompt image=5 \
+  --max-num-batched-tokens 32768 \
+  --max-num-seqs 64
