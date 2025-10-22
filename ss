@@ -1,32 +1,17 @@
-python - <<'PY'
-import inspect, sys
-from importlib import import_module
-m = import_module("openai_frontend.schemas.openai")
-print("Loaded from:", m.__file__)
-print("Has TypeInputFile? ", hasattr(m, "ChatCompletionRequestMessageContentPartInputFile"))
-print("Has TypeInputImage? ", hasattr(m, "ChatCompletionRequestMessageContentPartInputImage"))
-PY
+command:
+  - /bin/bash
+  - -lc
+  - |
+    # 1) start local vLLM OpenAI server on 127.0.0.1:8000
+    python -m vllm.entrypoints.openai.api_server \
+      --model /model_files/llama-4-scout-17b-16e \
+      --host 127.0.0.1 --port 8000 \
+      --dtype auto --gpu-memory-utilization 0.90 &
 
-python - <<'PY'
-from importlib import import_module
-r = import_module("openai_frontend.frontend.fastapi.routers.chat")
-src = open(r.__file__, "r", encoding="utf-8").read()
-print("Router:", r.__file__)
-print("Has _has_image_parts:", "_has_image_parts" in src)
-print("Reads VLLM_OPENAI_BASE:", "VLLM_OPENAI_BASE" in src)
-PY
+    # 2) export the proxy base so the frontend can route image requests
+    export VLLM_OPENAI_BASE=http://127.0.0.1:8000/v1
 
-python - <<'PY'
-import os
-print("VLLM_OPENAI_BASE =", os.getenv("VLLM_OPENAI_BASE"))
-PY
-
-curl -s http://localhost:9000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"whatever","messages":[{"role":"user","content":"ping"}]}'
-
-  curl -s http://localhost:9000/v1/chat/completions \
-  -H 'content-type: application/json' \
-  -d '{"model":"m","messages":[{"role":"user","content":[{"type":"input_file","mime_type":"application/pdf","data":"BASE64"}]}]}'
-
-
+    # 3) start Triton OpenAI frontend on :9000 (your existing line)
+    python3 /opt/tritonserver/python/openai/openai_frontend/main.py \
+      --model-repository ${MODEL_REPOSITORY} \
+      --tokenizer ${TOKENIZER}
