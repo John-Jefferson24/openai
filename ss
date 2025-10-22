@@ -1,43 +1,20 @@
-command:
-  - /bin/bash
-  - -lc
-  - |
-    # 1) start local vLLM OpenAI server on 127.0.0.1:8000
-    python -m vllm.entrypoints.openai.api_server \
-      --model /model_files/llama-4-scout-17b-16e \
-      --host 127.0.0.1 --port 8000 \
-      --dtype auto --gpu-memory-utilization 0.90 &
+from openai import OpenAI
+import base64, json
 
-    # 2) export the proxy base so the frontend can route image requests
-    export VLLM_OPENAI_BASE=http://127.0.0.1:8000/v1
+client = OpenAI(base_url="http://<TRITON_HOST>:9000/v1", api_key="sk-offline")
 
-    # 3) start Triton OpenAI frontend on :9000 (your existing line)
-    python3 /opt/tritonserver/python/openai/openai_frontend/main.py \
-      --model-repository ${MODEL_REPOSITORY} \
-      --tokenizer ${TOKENIZER}
+with open("doc.pdf","rb") as f:
+    b64 = base64.b64encode(f.read()).decode()
 
-      
-import base64
-import json
-import requests
-
-pdf_path = "/path/to/file.pdf"
-endpoint = "http://localhost:9000/v1/chat/completions"
-
-with open(pdf_path, "rb") as f:
-    b64 = base64.b64encode(f.read()).decode("utf-8")
-
-payload = {
-    "model": "llama-4-scout-17b-16e",
-    "messages": [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "Summarize and extract important tables."},
-            {"type": "input_file", "mime_type": "application/pdf", "data": b64}
+resp = client.chat.completions.create(
+    model="llama-4-scout-17b-16e",  # use the ID shown by GET /v1/models
+    messages=[{
+        "role":"user",
+        "content":[
+            {"type":"text","text":"Summarize the document in 10 bullets. Then list any tables you found with page numbers."},
+            {"type":"input_file","mime_type":"application/pdf","data": b64}
         ]
-    }]
-}
+    }],
+)
 
-resp = requests.post(endpoint, json=payload)
-print(resp.text)
-
+print(resp.choices[0].message.content)
