@@ -1,0 +1,297 @@
+Patch 1
+schemas/openai.py
+
+1A. Add these classes near the existing content-part types (around ChatCompletionRequestMessageContentPartImage)
+
+# --- BEGIN: added for base64 images and PDFs ---
+class TypeInputImage(Enum):
+    input_image = "input_image"
+
+class InputImagePayload(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+    data: str = Field(..., description="Base64-encoded image bytes")
+    mime_type: str = Field(..., description="Image mime type (image/png, image/jpeg, image/webp)")
+
+class ChatCompletionRequestMessageContentPartInputImage(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+    type: TypeInputImage = Field(..., description="The type of the content part.")
+    image: InputImagePayload
+
+
+class TypeInputFile(Enum):
+    input_file = "input_file"
+
+class ChatCompletionRequestMessageContentPartInputFile(BaseModel):
+    model_config = ConfigDict(use_enum_values=True)
+    type: TypeInputFile = Field(..., description="The type of the content part.")
+    mime_type: str = Field(..., description="Mime type of the file (e.g., application/pdf)")
+    data: str = Field(..., description="Base64-encoded file bytes")
+# --- END: added for base64 images and PDFs ---
+
+1B. Extend the union ChatCompletionRequestMessageContentPart
+Find:
+
+class ChatCompletionRequestMessageContentPart(RootModel):
+    root: Union[
+        ChatCompletionRequestMessageContentPartText,
+        ChatCompletionRequestMessageContentPartImage,
+    ]
+
+Change to:
+
+class ChatCompletionRequestMessageContentPart(RootModel):
+    root: Union[
+        ChatCompletionRequestMessageContentPartText,
+        ChatCompletionRequestMessageContentPartImage,
+        ChatCompletionRequestMessageContentPartInputImage,
+        ChatCompletionRequestMessageContentPartInputFile,
+    ]
+
+Patch 2
+engine/utils/pdf_processor.py
+
+Create python/openai/openai_frontend/engine/utils/pdf_processor.py:
+
+import io, os, time, json
+from dataclasses import dataclass, asdict
+from typing import List, Dict, Any
+
+import pdfplumber
+import fitz  # PyMuPDF
+
+try:
+    import easyocr
+    _OCR_OK = True
+except Exception:
+    _OCR_OK = False
+
+TEXT_CHAR_BUDGET    = int(os.getenv("PDF_TEXT_CHAR_BUDGET", "80000"))
+TABLE_CELL_BUDGET   = int(os.getenv("PDF_TABLE_CELL_BUDGET", "15000"))
+PER_PAGE_TIMEOUT_MS = int(os.getenv("PDF_PER_PAGE_TIMEOUT_MS", "250"))
+OCR_ENABLED         = os.getenv("PDF_OCR_ENABLED", "true").lower() == "true"
+OCR_MAX_PAGES       = int(os.getenv("PDF_OCR_MAX_PAGES", "10"))
+OCR_TIME_BUDGET_S   = int(os.getenv("PDF_OCR_TIME_BUDGET_S", "30"))
+
+@dataclass
+class PageIndex:
+    page: int
+    has_text: bool
+    word_count: int
+    table_count: int
+    figure_count: int
+
+@dataclass
+class AnalysisPack:
+    meta: dict
+    index: list
+    text_excerpt: str
+    tables_markdown: list
+    image_urls: list
+    notes: dict
+
+def _table_to_markdown(table, cell_budget_left):
+    if not table or not table[0]:
+        return None, cell_budget_left
+    headers = table[0]
+    rows = table[1:]
+    consumed = len(headers)
+    out_rows = []
+    for r in rows:
+        rc = len(r)
+        if consumed + rc > cell_budget_left:
+            break
+        out_rows.append(r)
+        consumed += rc
+    head = "| " + " | ".join(h or "" for h in headers) + " |"
+    sep  = "| " + " | ".join("---" for _ in headers) + " |"
+    body = ["| " + " | ".join((c or "") for c in r) + " |" for r in out_rows]
+    md = "\n".join([head, sep] + body)
+    return md, cell_budget_left - consumed
+
+def process_pdf_bytes(pdf_bytes: bytes) -> AnalysisPack:
+    t0 = time.time()
+    text_budget = TEXT_CHAR_BUDGET
+    table_budget = TABLE_CELL_BUDGET
+    ocr_time_used = 0.0
+    ocr_pages_done = 0
+
+    index: List[Dict[str, Any]] = []
+    text_chunks: List[str] = []
+    md_tables: List[str] = []
+    image_urls: List[str] = []
+
+    with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+        meta = {
+            "pages": len(pdf.pages),
+            "docinfo": {k: (str(v) if v is not None else "") for k, v in (pdf.metadata or {}).items()},
+        }
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+        for i in range(len(pdf.pages)):
+            page_start = time.time()
+            page_pl = pdf.pages[i]
+            page_fz = doc.load_page(i)
+
+            figures = len(page_pl.images or []) + len(page_fz.get_images(full=True) or [])
+            text = ""
+            has_text = False
+            words = 0
+
+            try:
+                text = page_pl.extract_text(layout=True) or ""
+                words = len(text.split())
+                has_text = len(text.strip()) > 0
+            except Exception:
+                text = ""
+
+            tables_here = 0
+            if table_budget > 0:
+                try:
+                    raw_tables = page_pl.extract_tables()
+                except Exception:
+                    raw_tables = []
+                for t in raw_tables:
+                    if table_budget <= 0:
+                        break
+                    md, table_budget = _table_to_markdown(t, table_budget)
+                    if md:
+                        md_tables.append(f"<!-- page:{i+1} -->\n{md}")
+                        tables_here += 1
+
+            if (not has_text) and OCR_ENABLED and _OCR_OK and (ocr_pages_done < OCR_MAX_PAGES) and (ocr_time_used < OCR_TIME_BUDGET_S):
+                ocr_t0 = time.time()
+                pix = page_fz.get_pixmap(dpi=180)
+                png_bytes = pix.tobytes("png")
+                try:
+                    reader = easyocr.Reader(['en'], gpu=False)
+                    res = reader.readtext(png_bytes, detail=0, paragraph=True)
+                    ocr_text = "\n".join(res).strip()
+                except Exception:
+                    ocr_text = ""
+                ocr_time = time.time() - ocr_t0
+                ocr_time_used += ocr_time
+                if ocr_text:
+                    text = ocr_text
+                    has_text = True
+                    words = len(text.split())
+                    ocr_pages_done += 1
+
+            if text and text_budget > 0:
+                chunk = text[: min(len(text), text_budget)]
+                text_chunks.append(f"\n## Page {i+1}\n{chunk}")
+                text_budget -= len(chunk)
+
+            index.append(PageIndex(
+                page=i+1, has_text=has_text, word_count=words, table_count=tables_here, figure_count=figures
+            ).__dict__)
+
+            if (time.time() - page_start) * 1000.0 > PER_PAGE_TIMEOUT_MS:
+                pass
+
+    notes = {
+        "truncated": (text_budget <= 0) or (table_budget <= 0),
+        "used_ocr": (ocr_pages_done > 0),
+        "ocr_pages_done": ocr_pages_done,
+        "budgets": {
+            "text_chars_used": TEXT_CHAR_BUDGET - text_budget,
+            "text_chars_budget": TEXT_CHAR_BUDGET,
+            "table_cells_budget_left": table_budget,
+            "ocr_time_used_s": round(ocr_time_used, 3),
+        },
+        "processed_secs": round(time.time() - t0, 3),
+    }
+
+    pack = AnalysisPack(
+        meta=meta,
+        index=index,
+        text_excerpt=("".join(text_chunks)).strip(),
+        tables_markdown=md_tables,
+        image_urls=image_urls,
+        notes=notes,
+    )
+    return pack
+
+def build_system_preamble(pack: AnalysisPack) -> str:
+    body = json.dumps(asdict(pack), ensure_ascii=False)
+    return (
+        "You are a document analysis assistant. Use the Analysis Pack below as ground truth.\n"
+        "- For summaries: ≤10 bullets + a JSON metadata object.\n"
+        "- For tables: output Markdown or CSV; cite page numbers.\n"
+        "- For figures: list the provided image URLs (if any).\n"
+        "- If asked for specific pages, extract only those; if content was truncated, say so.\n"
+        "\n--- BEGIN ANALYSIS PACK (JSON) ---\n"
+        f"{body}\n"
+        "--- END ANALYSIS PACK ---\n"
+    )
+
+Patch 3 — engine/utils/media_validate.py
+Create python/openai/openai_frontend/engine/utils/media_validate.py:
+
+import os, base64
+
+MAX_IMAGE_BYTES = int(os.getenv("MEDIA_MAX_IMAGE_BYTES", "5000000"))
+ALLOWED = set((os.getenv("MEDIA_MIME_ALLOW", "image/jpeg,image/png,image/webp")).split(","))
+
+def preflight_input_image_part(part: dict):
+    if part.get("type") != "input_image":
+        return
+    img = part.get("image", {})
+    mime = (img.get("mime_type") or "").lower()
+    data = img.get("data") or ""
+    if mime not in ALLOWED:
+        raise ValueError(f"Unsupported image mime: {mime}")
+    if int(len(data) * 0.75) > MAX_IMAGE_BYTES:
+        raise ValueError("Image too large (precheck)")
+    raw = base64.b64decode(data)
+    if len(raw) > MAX_IMAGE_BYTES:
+        raise ValueError("Image too large")
+
+Patch 4 — engine/utils/chat.py
+Replace the existing _parse_chat_message_content_parts with this version (it’s a small local change):
+
+Patch 5 — frontend/fastapi/routers/chat.py
+
+A) Add imports
+
+from fastapi import APIRouter, HTTPException, Request
+import os, requests
+from fastapi.responses import StreamingResponse
+
+
+B) Add helpers (top-level in this file)
+
+VLLM_OPENAI_BASE = os.getenv("VLLM_OPENAI_BASE", "disabled").strip()
+
+def _has_image_parts(request: CreateChatCompletionRequest) -> bool:
+    for m in (request.messages or []):
+        parts = getattr(m, "content", None)
+        if isinstance(parts, list):
+            for p in parts:
+                t = getattr(p.root, "type", None)
+                if t in ("image_url", "input_image"):
+                    return True
+    return False
+
+C) In create_chat_completion(...), at the very top of the function body, insert:
+
+    # Early image path: proxy to local vLLM OpenAI server if configured
+    if _has_image_parts(request):
+        if VLLM_OPENAI_BASE == "disabled":
+            raise HTTPException(status_code=400, detail="Image inputs are not supported on this deployment (set VLLM_OPENAI_BASE to enable).")
+        try:
+            r = requests.post(
+                f"{VLLM_OPENAI_BASE}/chat/completions",
+                json=request.model_dump(mode="json"),
+                stream=True,
+                timeout=300,
+            )
+        except requests.RequestException as e:
+            raise HTTPException(status_code=502, detail=f"Image backend unreachable: {e}")
+        return StreamingResponse(
+            r.iter_content(chunk_size=8192),
+            media_type=r.headers.get("content-type","application/json"),
+            status_code=r.status_code,
+        )
+
+
+
