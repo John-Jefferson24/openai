@@ -15,3 +15,29 @@ command:
     python3 /opt/tritonserver/python/openai/openai_frontend/main.py \
       --model-repository ${MODEL_REPOSITORY} \
       --tokenizer ${TOKENIZER}
+
+      
+import base64
+import json
+import requests
+
+pdf_path = "/path/to/file.pdf"
+endpoint = "http://localhost:9000/v1/chat/completions"
+
+with open(pdf_path, "rb") as f:
+    b64 = base64.b64encode(f.read()).decode("utf-8")
+
+payload = {
+    "model": "llama-4-scout-17b-16e",
+    "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "Summarize and extract important tables."},
+            {"type": "input_file", "mime_type": "application/pdf", "data": b64}
+        ]
+    }]
+}
+
+resp = requests.post(endpoint, json=payload)
+print(resp.text)
+
