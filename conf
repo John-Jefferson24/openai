@@ -151,7 +151,7 @@ pdf_processor = PDFProcessorHook()
 model_list:
   - model_name: llama-4-scout
     litellm_params:
-      model: model: hosted_vllm/meta-llama/Llama-4-Scout-17B-16E
+      model: model: hosted_vllm/llama-4-scout-17b-16e
       api_base: http://127.0.0.1:8010
 
 litellm_settings:
