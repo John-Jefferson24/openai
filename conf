@@ -158,5 +158,5 @@ litellm_settings:
   callbacks: hooks.pdf_processor.pdf_processor
 
 general_settings:
-  enable_jwt_auth: false
+    enable_jwt_auth: false
 
