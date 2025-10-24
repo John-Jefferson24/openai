@@ -153,10 +153,9 @@ model_list:
     litellm_params:
       model: model: hosted_vllm/llama-4-scout-17b-16e
       api_base: http://127.0.0.1:8010
+    model_info:
+      supports_vision: True  
 
 litellm_settings:
-  callbacks: hooks.pdf_processor.pdf_processor
-
-general_settings:
-    enable_jwt_auth: false
+  callbacks: hooks.pdf_processor.pdf_processor 
 
