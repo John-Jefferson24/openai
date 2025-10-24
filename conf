@@ -159,3 +159,6 @@ model_list:
 litellm_settings:
   callbacks: hooks.pdf_processor.pdf_processor 
 
+      api_base: http://127.0.0.1:8010/v1
+      api_key: "no-key-required"
+
