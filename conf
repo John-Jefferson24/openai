@@ -1,17 +1,21 @@
+# hooks/pdf_processor.py
 import os, re, io, base64
-from typing import Any, Dict, List, Optional
-from litellm.proxy._types import ProxyPreCallHook
+from typing import Any, Dict, List, Optional, Literal
 
-# Lazy imports
+# ✅ Proxy hooks live on CustomLogger (name is historical; it's the plugin surface for logging + middleware)
+from litellm.integrations.custom_logger import CustomLogger
+
+# --------- Lazy imports for optional deps ----------
 def _mods():
     import importlib
     m = {}
     for name in ("pdfplumber", "fitz", "easyocr", "numpy"):
         try:
-            m[name] = importlib.import_module(name if name != "fitz" else "fitz")
+            m[name] = importlib.import_module(name)
         except Exception:
             m[name] = None
     return m
+# ---------------------------------------------------
 
 PDF_DATA_PREFIX = "data:application/pdf;base64,"
 PDF_MAX_MB = float(os.environ.get("PDF_FILESIZE_LIMIT_MB", "20"))
@@ -19,8 +23,10 @@ PDF_MAX_PAGES = int(os.environ.get("PDF_MAX_PAGES", "25"))
 OCR_MAX_PAGES = int(os.environ.get("PDF_OCR_MAX_PAGES", "5"))
 TOKEN_BUDGET = int(os.environ.get("PDF_TOKEN_BUDGET", "6000"))
 USE_EASYOCR = os.environ.get("PDF_USE_EASYOCR", "1") == "1"
+EASYOCR_GPU = os.environ.get("PDF_EASYOCR_GPU", "1") == "1"  # set "0" to force CPU
 
 def _collect_pdf_data_urls(messages: List[Dict[str, Any]]) -> Optional[Dict[str, str]]:
+    # Looks for {"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"..."}}
     for msg in messages:
         content = msg.get("content")
         if isinstance(content, list):
@@ -39,12 +45,19 @@ def _mb(nbytes: int) -> float:
     return nbytes / (1024 * 1024.0)
 
 def _truncate(text: str, tokens: int) -> str:
+    # naive token≈chars heuristic (4 chars ~ 1 token)
     return text[: max(1, tokens) * 4]
 
 def _clean(text: str) -> str:
     text = re.sub(r"[ \t]+", " ", text)
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
+
+def _already_injected(messages: List[Dict[str, Any]]) -> bool:
+    if not messages or not isinstance(messages[0], dict):
+        return False
+    c = messages[0].get("content", "")
+    return isinstance(c, str) and c.startswith("[Extracted from ")
 
 def _extract_pdfplumber(pdf_bytes: bytes, m) -> Optional[str]:
     pp = m.get("pdfplumber")
@@ -68,8 +81,7 @@ def _extract_ocr(pdf_bytes: bytes, m) -> Optional[str]:
     if not (fitz and easyocr and np):
         return None
     try:
-        import numpy as np
-        reader = easyocr.Reader(["en"], gpu=True)
+        reader = easyocr.Reader(["en"], gpu=EASYOCR_GPU)
         doc = fitz.open(stream=pdf_bytes, filetype="pdf")
         out, pages = [], 0
         for page in doc:
@@ -89,34 +101,58 @@ def _inject(messages: List[Dict[str, Any]], text: str, label: str) -> List[Dict[
     header = f"[Extracted from {label}]\n{text}"
     return [{"role": "system", "content": header}] + messages
 
-class PDFProcessorHook(ProxyPreCallHook):
-    async def async_pre_call_hook(self, model: str, messages: List[Dict[str, Any]], **kwargs) -> Dict:
+class PDFProcessorHook(CustomLogger):
+    """
+    Proxy call-hook:
+      async_pre_call_hook(self, user_api_key_dict, cache, data, call_type) -> dict|str
+    'data' is the OpenAI-style request payload (includes 'model', 'messages', etc.)
+    Return a mutated 'data' to proceed; return a string or raise to short-circuit.
+    """
+    async def async_pre_call_hook(
+        self,
+        user_api_key_dict,  # litellm.proxy.proxy_server.UserAPIKeyAuth
+        cache,              # litellm.proxy.proxy_server.DualCache
+        data: dict,
+        call_type: Literal["completion","text_completion","embeddings","image_generation","moderation","audio_transcription"]
+    ):
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        if _already_injected(messages):
+            return data
+
         found = _collect_pdf_data_urls(messages)
         if not found:
-            return {}
+            return data
+
         label = found["filename"]
         pdf_bytes = _b64bytes(found["data"])
+
         if _mb(len(pdf_bytes)) > PDF_MAX_MB:
             note = f"[Note] Skipped PDF '{label}' – size {_mb(len(pdf_bytes)):.1f}MB exceeds limit {PDF_MAX_MB}MB."
-            return {"messages": [{"role": "system", "content": note}] + messages}
+            data["messages"] = [{"role": "system", "content": note}] + messages
+            return data
+
         m = _mods()
         text = _extract_pdfplumber(pdf_bytes, m)
         if (not text) and USE_EASYOCR:
             text = _extract_ocr(pdf_bytes, m)
         if not text:
-            return {}
-        text = _truncate(text, TOKEN_BUDGET)
-        new_messages = _inject(messages, text, label)
-        return {"messages": new_messages}
+            return data
 
-# Instantiate the hook
+        text = _truncate(text, TOKEN_BUDGET)
+        data["messages"] = _inject(messages, text, label)
+        return data
+
+# Export a SINGLETON instance for config.yaml
 pdf_processor = PDFProcessorHook()
 
-litellm yaml:
+
+model_list:
+  - model_name: llama-4-scout
+    litellm_params:
+      model: llama-4-scout-17b-16e
+      api_base: http://127.0.0.1:8010
 
 litellm_settings:
   callbacks: hooks.pdf_processor.pdf_processor
-
-docker 
-export PYTHONPATH=$PYTHONPATH:/opt/litellm/hooks
-  
