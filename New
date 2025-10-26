@@ -1,0 +1,278 @@
+new proxy::--------------
+import os
+from fastapi import FastAPI, Request, Response
+from fastapi.responses import StreamingResponse
+import httpx
+
+VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000").rstrip("/")
+
+app = FastAPI()
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"])
+async def proxy(request: Request, path: str):
+    """Pass everything to vLLM as-is"""
+    
+    body = await request.body()
+    
+    # Only check for PDF if this looks like chat completions
+    if body and "chat/completions" in path:
+        try:
+            import json
+            data = json.loads(body)
+            
+            # Quick check: does any message have PDF file type?
+            messages = data.get("messages", [])
+            has_pdf = any(
+                isinstance(msg.get("content"), list) and
+                any(
+                    part.get("type") == "file" and
+                    str(part.get("file", {}).get("file_data", "")).startswith("data:application/pdf;base64,")
+                    for part in msg["content"] if isinstance(part, dict)
+                )
+                for msg in messages if isinstance(msg, dict)
+            )
+            
+            if has_pdf:
+                from pdf_processor import pdf_processor
+                data = pdf_processor.process_pdf(data)
+                body = json.dumps(data).encode()
+        except:
+            pass  # Any error, just pass original body through
+    
+    # Forward everything to vLLM
+    url = f"{VLLM_URL}/{path}"
+    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
+    
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        # Check if streaming
+        if b'"stream":true' in body or b'"stream": true' in body:
+            async def stream():
+                async with client.stream(
+                    method=request.method,
+                    url=url,
+                    headers=headers,
+                    params=request.query_params,
+                    content=body
+                ) as resp:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+            
+            return StreamingResponse(stream(), media_type="text/event-stream")
+        
+        # Regular request
+        resp = await client.request(
+            method=request.method,
+            url=url,
+            headers=headers,
+            params=request.query_params,
+            content=body
+        )
+        
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=9000)
+
+----pdf processing---------
+
+import os
+import re
+import io
+import base64
+from typing import Dict, List, Optional
+
+# ===== CONFIG =====
+PDF_DATA_PREFIX = "data:application/pdf;base64,"
+PDF_MAX_MB = float(os.environ.get("PDF_FILESIZE_LIMIT_MB", "20"))
+PDF_MAX_PAGES = int(os.environ.get("PDF_MAX_PAGES", "25"))
+OCR_MAX_PAGES = int(os.environ.get("PDF_OCR_MAX_PAGES", "5"))
+TOKEN_BUDGET = int(os.environ.get("PDF_TOKEN_BUDGET", "6000"))
+USE_EASYOCR = os.environ.get("PDF_USE_EASYOCR", "1") == "1"
+EASYOCR_GPU = os.environ.get("PDF_EASYOCR_GPU", "1") == "1"
+
+# ===== LAZY IMPORTS =====
+def _mods():
+    import importlib
+    m = {}
+    for name in ("pdfplumber", "fitz", "easyocr", "numpy"):
+        try:
+            m[name] = importlib.import_module(name)
+        except Exception:
+            m[name] = None
+    return m
+
+# ===== HELPERS =====
+def _collect_pdf_data_urls(messages: List[Dict]) -> Optional[Dict[str, str]]:
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "file":
+                    f = part.get("file") or {}
+                    data = f.get("file_data")
+                    if isinstance(data, str) and data.startswith(PDF_DATA_PREFIX):
+                        return {"filename": f.get("filename") or "file.pdf", "data": data}
+    return None
+
+def _b64bytes(data_url: str) -> bytes:
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+def _mb(nbytes: int) -> float:
+    return nbytes / (1024 * 1024.0)
+
+def _truncate(text: str, tokens: int) -> str:
+    return text[: max(1, tokens) * 4]
+
+def _clean(text: str) -> str:
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+def _already_injected(messages: List[Dict]) -> bool:
+    if not messages or not isinstance(messages[0], dict):
+        return False
+    c = messages[0].get("content", "")
+    return isinstance(c, str) and c.startswith("[Extracted from ")
+
+def _extract_pdfplumber(pdf_bytes: bytes, m) -> Optional[str]:
+    pp = m.get("pdfplumber")
+    if not pp:
+        return None
+    try:
+        out, pages = [], 0
+        with pp.open(io.BytesIO(pdf_bytes)) as pdf:
+            for p in pdf.pages:
+                if pages >= PDF_MAX_PAGES:
+                    break
+                out.append(p.extract_text(x_tolerance=3, y_tolerance=3) or "")
+                pages += 1
+        text = "\n\n".join(out).strip()
+        return _clean(text) if text else None
+    except Exception as e:
+        print(f"pdfplumber extraction failed: {e}")
+        return None
+
+def _extract_ocr(pdf_bytes: bytes, m) -> Optional[str]:
+    fitz, easyocr, np = m.get("fitz"), m.get("easyocr"), m.get("numpy")
+    if not (fitz and easyocr and np):
+        return None
+    try:
+        reader = easyocr.Reader(["en"], gpu=EASYOCR_GPU)
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        out, pages = [], 0
+        for page in doc:
+            if pages >= OCR_MAX_PAGES:
+                break
+            pm = page.get_pixmap(alpha=False, dpi=200)
+            arr = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, pm.n)
+            lines = reader.readtext(arr, detail=0, paragraph=True)
+            out.append("\n".join(lines))
+            pages += 1
+        text = "\n\n".join(out).strip()
+        return _clean(text) if text else None
+    except Exception:
+        return None
+
+def _inject(messages: List[Dict], text: str, label: str) -> List[Dict]:
+    header = f"[Extracted from {label}]\n{text}"
+    return [{"role": "system", "content": header}] + messages
+
+def _inject_error(messages: List[Dict], error_msg: str) -> List[Dict]:
+    return [{"role": "system", "content": f"[PDF Processing Error] {error_msg}"}] + messages
+
+# ===== MAIN PROCESSOR =====
+class PDFProcessor:
+    def process_pdf(self, data: dict) -> dict:
+        """Process PDF in request data and inject extracted text"""
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        
+        if _already_injected(messages):
+            return data
+
+        found = _collect_pdf_data_urls(messages)
+        if not found:
+            return data
+
+        label = found["filename"]
+        pdf_bytes = _b64bytes(found["data"])
+
+        if _mb(len(pdf_bytes)) > PDF_MAX_MB:
+            note = f"[Note] Skipped PDF '{label}' – size {_mb(len(pdf_bytes)):.1f}MB exceeds limit {PDF_MAX_MB}MB."
+            data["messages"] = [{"role": "system", "content": note}] + messages
+            return data
+
+        m = _mods()
+        text = _extract_pdfplumber(pdf_bytes, m)
+        if (not text) and USE_EASYOCR:
+            text = _extract_ocr(pdf_bytes, m)
+        
+        if not text:
+            # No text extracted - return error instead of blank
+            error_msg = f"Unable to extract text from '{label}'. PDF may be image-based or corrupted."
+            if not m.get("pdfplumber"):
+                error_msg += " (pdfplumber not installed)"
+            if USE_EASYOCR and not all([m.get("fitz"), m.get("easyocr"), m.get("numpy")]):
+                error_msg += " (OCR libraries not installed)"
+            data["messages"] = _inject_error(messages, error_msg)
+            return data
+
+        text = _truncate(text, TOKEN_BUDGET)
+        data["messages"] = _inject(messages, text, label)
+        return data
+
+# Export singleton instance
+pdf_processor = PDFProcessor()
+
+----requiremnetns---
+
+# Core proxy dependencies
+fastapi==0.109.0
+uvicorn[standard]==0.27.0
+httpx==0.26.0
+
+# PDF processing - text extraction
+pdfplumber==0.11.0
+
+# PDF processing - OCR (optional but recommended for H100)
+pymupdf==1.23.26
+easyocr==1.7.1
+numpy==1.26.3
+
+
+------------------
+samplke docker --
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+# Install system dependencies for OCR
+RUN apt-get update && apt-get install -y \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Python dependencies
+RUN pip install --no-cache-dir \
+    fastapi==0.109.0 \
+    uvicorn==0.27.0 \
+    httpx==0.26.0 \
+    pdfplumber==0.11.0 \
+    pymupdf==1.23.26 \
+    easyocr==1.7.1 \
+    numpy==1.26.3
+
+# Copy application files
+COPY proxy.py /app/
+COPY pdf_processor.py /app/
+
+EXPOSE 8080
+
+CMD ["python", "-m", "uvicorn", "proxy:app", "--host", "0.0.0.0", "--port", "8080"]
