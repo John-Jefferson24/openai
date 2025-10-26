@@ -275,4 +275,4 @@ COPY pdf_processor.py /app/
 
 EXPOSE 8080
 
-CMD ["python", "-m", "uvicorn", "proxy:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["python", "-m", "uvicorn", "proxy:app", "--host", "0.0.0.0", "--port", "9000"]
