@@ -4,7 +4,7 @@ from fastapi import FastAPI, Request, Response
 from fastapi.responses import StreamingResponse
 import httpx
 
-VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000").rstrip("/")
+VLLM_URL = os.getenv("VLLM_URL", "http://localhost:8000/v1").rstrip("/")
 
 app = FastAPI()
 
@@ -41,8 +41,11 @@ async def proxy(request: Request, path: str):
     
     # Forward everything to vLLM
     url = f"{VLLM_URL}/{path}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}
-    # ↑ Remove content-length - httpx will set correct value based on body
+    
+    # Remove hop-by-hop headers (must not be forwarded per HTTP spec)
+    hop_by_hop = {"host", "content-length", "transfer-encoding", "connection", 
+                  "keep-alive", "te", "trailer", "upgrade", "proxy-authorization"}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in hop_by_hop}
     
     async with httpx.AsyncClient(timeout=300.0) as client:
         # Check if streaming
