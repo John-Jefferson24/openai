@@ -167,3 +167,5 @@ curl -X 'GET' \
   -H 'accept: application/json' \
   -H 'x-api-key: sk-1234'
 
+LITELLM_LICENSE=""
+
