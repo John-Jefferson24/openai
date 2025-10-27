@@ -1,0 +1,202 @@
+import os
+import base64
+from typing import Dict, List, Optional
+
+# ===== CONFIG =====
+PDF_DATA_PREFIX = "data:application/pdf;base64,"
+PDF_MAX_MB = float(os.environ.get("PDF_FILESIZE_LIMIT_MB", "50"))
+PDF_MAX_PAGES = int(os.environ.get("PDF_MAX_PAGES", "10"))  # Reduced for images
+PDF_IMAGE_DPI = int(os.environ.get("PDF_IMAGE_DPI", "100"))  # Lower DPI for smaller images
+
+# ===== LAZY IMPORTS =====
+def _mods():
+    import importlib
+    m = {}
+    for name in ("fitz",):  # Only need PyMuPDF
+        try:
+            m[name] = importlib.import_module(name)
+        except Exception:
+            m[name] = None
+    return m
+
+# ===== HELPERS =====
+def _collect_pdf_data_urls(messages: List[Dict]) -> Optional[Dict[str, str]]:
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "file":
+                    f = part.get("file") or {}
+                    data = f.get("file_data")
+                    if isinstance(data, str) and data.startswith(PDF_DATA_PREFIX):
+                        return {"filename": f.get("filename") or "file.pdf", "data": data}
+    return None
+
+def _b64bytes(data_url: str) -> bytes:
+    return base64.b64decode(data_url.split(",", 1)[1])
+
+def _mb(nbytes: int) -> float:
+    return nbytes / (1024 * 1024.0)
+
+def _already_injected(messages: List[Dict]) -> bool:
+    """Check if we already processed PDFs (look for our marker text)"""
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text = part.get("text", "")
+                    if text.startswith("[PDF:") or text.startswith("[PDF Processing Error]"):
+                        return True  # Found our marker
+    return False
+
+def _pdf_to_images(pdf_bytes: bytes, m) -> Optional[List[str]]:
+    """Convert PDF pages to base64 PNG images"""
+    fitz = m.get("fitz")
+    if not fitz:
+        return None
+    
+    try:
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        images = []
+        
+        for i, page in enumerate(doc):
+            if i >= PDF_MAX_PAGES:
+                break
+            
+            # Render page to image with lower DPI for reasonable size
+            pix = page.get_pixmap(dpi=PDF_IMAGE_DPI)
+            
+            # Convert to JPEG for smaller size (PNG can be huge)
+            img_bytes = pix.tobytes("jpeg", jpg_quality=85)
+            
+            # Check individual image size (skip if > 5MB)
+            if len(img_bytes) > 5 * 1024 * 1024:
+                print(f"Warning: Page {i+1} skipped - image too large ({len(img_bytes)/(1024*1024):.1f}MB)")
+                continue
+            
+            img_b64 = base64.b64encode(img_bytes).decode('utf-8')
+            images.append(f"data:image/jpeg;base64,{img_b64}")
+        
+        return images if images else None
+    except Exception as e:
+        print(f"PDF to image conversion failed: {e}")
+        return None
+
+def _replace_pdf_with_images(messages: List[Dict], images: List[str], label: str) -> List[Dict]:
+    """Replace PDF file with SEPARATE messages for each page (vLLM limitation)"""
+    modified = []
+    
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            # Check if this message contains the PDF file
+            has_pdf = any(
+                isinstance(part, dict) and part.get("type") == "file"
+                for part in content
+            )
+            
+            if has_pdf:
+                # Extract other content (text, etc.) that's not the PDF
+                other_content = [
+                    part for part in content
+                    if not (isinstance(part, dict) and part.get("type") == "file")
+                ]
+                
+                # Create message for intro text
+                modified.append({
+                    "role": msg.get("role", "user"),
+                    "content": [
+                        {"type": "text", "text": f"[PDF Document: {label} - {len(images)} page(s)]"},
+                        {"type": "text", "text": "I will show you each page separately. Please analyze all pages together."}
+                    ]
+                })
+                
+                # Create SEPARATE message for EACH page (vLLM limitation: one image per message)
+                for idx, img_data in enumerate(images):
+                    modified.append({
+                        "role": msg.get("role", "user"),
+                        "content": [
+                            {"type": "text", "text": f"Page {idx + 1} of {len(images)}:"},
+                            {"type": "image_url", "image_url": {"url": img_data}}
+                        ]
+                    })
+                
+                # Add the original user question/text at the end
+                if other_content:
+                    modified.append({
+                        "role": msg.get("role", "user"),
+                        "content": other_content
+                    })
+            else:
+                # Keep non-PDF messages unchanged
+                modified.append(msg)
+        else:
+            # Keep non-list content unchanged
+            modified.append(msg)
+    
+    return modified
+
+def _inject_error(messages: List[Dict], error_msg: str) -> List[Dict]:
+    """Replace PDF file with error message"""
+    modified = []
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):
+            new_content = []
+            for part in content:
+                if isinstance(part, dict) and part.get("type") == "file":
+                    new_content.append({
+                        "type": "text",
+                        "text": f"[PDF Processing Error] {error_msg}"
+                    })
+                else:
+                    new_content.append(part)
+            modified.append({**msg, "content": new_content})
+        else:
+            modified.append(msg)
+    return modified
+
+# ===== MAIN PROCESSOR =====
+class PDFProcessor:
+    def process_pdf(self, data: dict) -> dict:
+        """Process PDF by converting to images for vision model"""
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            return data
+        
+        if _already_injected(messages):
+            return data
+
+        found = _collect_pdf_data_urls(messages)
+        if not found:
+            return data
+
+        label = found["filename"]
+        pdf_bytes = _b64bytes(found["data"])
+
+        if _mb(len(pdf_bytes)) > PDF_MAX_MB:
+            note = f"Skipped PDF '{label}' – size {_mb(len(pdf_bytes)):.1f}MB exceeds limit {PDF_MAX_MB}MB."
+            data["messages"] = _inject_error(messages, note)
+            return data
+
+        m = _mods()
+        if not m.get("fitz"):
+            error_msg = f"Cannot process '{label}'. Missing pymupdf library (pip install pymupdf)."
+            data["messages"] = _inject_error(messages, error_msg)
+            return data
+
+        # Convert PDF pages to images
+        images = _pdf_to_images(pdf_bytes, m)
+        
+        if not images:
+            error_msg = f"Unable to convert '{label}' to images. PDF may be corrupted or empty."
+            data["messages"] = _inject_error(messages, error_msg)
+            return data
+
+        # Replace PDF file with images
+        data["messages"] = _replace_pdf_with_images(messages, images, label)
+        return data
+
+# Export singleton instance
+pdf_processor = PDFProcessor()
